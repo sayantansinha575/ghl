@@ -2,7 +2,9 @@ import express from "express";
 import axios from "axios";
 
 const app = express();
+app.use(express.raw({ type: '*/*' }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // ✅ Google API Key (keep it secret in .env for production)
 const GOOGLE_API_KEY = "AIzaSyDGhn92p1EilcJwrBg1Fiv3NwXssPh0Z7c";
@@ -24,6 +26,9 @@ app.get("/", (req, res) => {
  */
 app.post("/check-available-slots", async (req, res) => {
   try {
+    console.log("Headers:", req.headers);
+    console.log("Raw body string:", req.rawBody);
+    console.log("Parsed body:", req.body);
     const { customerAddress, staffAddress, requestedDate, requestedTime } = req.body;
 
     if (!customerAddress || !staffAddress || !requestedDate || !requestedTime) {
