@@ -27,9 +27,9 @@ app.get("/", (req, res) => {
 app.post("/check-available-slots", async (req, res) => {
   try {
     console.log("Headers:", req.headers);
-    console.log("Raw body string:", req.rawBody);
+    // console.log("Raw body string:", req.rawBody);
     console.log("Parsed body:", req.body);
-    const { customerAddress, staffAddress, requestedDate, requestedTime } = req.body;
+    const { customerAddress, staffAddress, requestedDate, requestedTime } = req.body.customData;
 
     if (!customerAddress || !staffAddress || !requestedDate || !requestedTime) {
       return res.status(400).json({ error: "Missing required fields" });
