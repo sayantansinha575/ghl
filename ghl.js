@@ -1,99 +1,166 @@
 import express from "express";
 import axios from "axios";
+import dayjs from "dayjs";
 
 const app = express();
-// app.use(express.raw({ type: '*/*' }));
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// ✅ Google API Key (keep it secret in .env for production)
+// ---- CONFIG ----
 const GOOGLE_API_KEY = "AIzaSyDGhn92p1EilcJwrBg1Fiv3NwXssPh0Z7c";
+const GHL_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJsb2NhdGlvbl9pZCI6IkhoSHRjYXlVc0NzeHFoY2hKVTdYIiwiY29tcGFueV9pZCI6IjhYeUFPNlMyTUltcWJtTm54dGJIIiwidmVyc2lvbiI6MSwiaWF0IjoxNjg2NDMwMDkyMTI5LCJzdWIiOiJ1c2VyX2lkIn0.DvYzFxWgBDknzfz8nWsy4_fjN3Jvibs2xKKAxRuXna4"; // Location-level API key
+const BUSINESS_START = "09:00";
+const BUSINESS_END = "17:00";
 
-// ✅ Root route for Render
 app.get("/", (req, res) => {
   res.send("✅ GHL Route Distance API is running successfully!");
 });
 
-/**
- * POST /check-available-slots
- * Example JSON body:
- * {
- *   "customerAddress": "123 Main St, Buffalo, NY",
- *   "staffAddress": "9990 Transit Rd, Buffalo, NY",
- *   "requestedDate": "2025-10-28",
- *   "requestedTime": "10:30 am"
- * }
- */
-app.post("/check-available-slots", async (req, res) => {
+// ---- Fetch appointments from GHL ----
+async function getAppointmentsFromGHL(calendarId, date) {
   try {
-    console.log("Headers:", req.headers);
-    // console.log("Raw body string:", req.rawBody);
-    console.log("Parsed body:", req.body);
-    const { customerAddress, staffAddress, requestedDate, requestedTime } = req.body.customData;
-
-    if (!customerAddress || !staffAddress || !requestedDate || !requestedTime) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
-
-    // 🗺️ Step 1: Calculate travel distance and time
-    const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${encodeURIComponent(
-      staffAddress
-    )}&destinations=${encodeURIComponent(customerAddress)}&key=${GOOGLE_API_KEY}`;
-
-    const response = await axios.get(url);
-    const data = response.data;
-
-    if (
-      !data.rows?.[0]?.elements?.[0] ||
-      data.rows[0].elements[0].status !== "OK"
-    ) {
-      throw new Error("Could not calculate distance between the given addresses");
-    }
-
-    const distance = data.rows[0].elements[0].distance.text;
-    const duration = data.rows[0].elements[0].duration.text;
-    const durationValue = data.rows[0].elements[0].duration.value / 60; // minutes
-
-    // 🕒 Step 2: Add buffer time (e.g., 15 minutes)
-    const bufferTime = 15;
-    const totalTravelTime = durationValue + bufferTime;
-
-    // 🧮 Step 3: Calculate next available slot
-    const appointmentDateTime = new Date(`${requestedDate} ${requestedTime}`);
-    const nextAvailable = new Date(
-      appointmentDateTime.getTime() + totalTravelTime * 60000
-    );
-
-    const slotStart = nextAvailable.toLocaleTimeString("en-US", {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-    const slotEnd = new Date(nextAvailable.getTime() + 30 * 60000).toLocaleTimeString(
-      "en-US",
+    const res = await axios.get(
+      `https://services.leadconnectorhq.com/calendars/appointments?calendarId=${calendarId}`,
       {
-        hour: "2-digit",
-        minute: "2-digit",
+        headers: {
+          Authorization: `Bearer ${GHL_API_KEY}`,
+          Version: "2021-07-28",
+        },
       }
     );
 
-    const availableSlot = `${slotStart} - ${slotEnd}`;
+    const allAppointments = res.data.appointments || [];
 
-    // ✅ Step 4: Send response
+    // Filter by same day
+    return allAppointments.filter((a) =>
+      dayjs(a.startTime).isSame(dayjs(date), "day")
+    );
+  } catch (err) {
+    console.error("GHL API Error:", err.response?.data || err.message);
+    return [];
+  }
+}
+
+// ---- Calculate Distance using Google Maps ----
+async function getTravelTime(origin, destination) {
+  try {
+    const res = await axios.get(
+      "https://maps.googleapis.com/maps/api/distancematrix/json",
+      {
+        params: {
+          origins: origin,
+          destinations: destination,
+          key: GOOGLE_API_KEY,
+        },
+      }
+    );
+
+    const element = res.data.rows[0].elements[0];
+    if (element.status === "OK") {
+      return {
+        distanceText: element.distance.text,
+        durationText: element.duration.text,
+        durationMinutes: Math.ceil(element.duration.value / 60),
+      };
+    } else {
+      console.warn("Distance matrix status:", element.status);
+      return null;
+    }
+  } catch (err) {
+    console.error("Google Distance API Error:", err.message);
+    return null;
+  }
+}
+
+// ---- Find previous appointment ----
+function findPreviousAppointment(appointments, requestedDateTime) {
+  let previous = null;
+  appointments.forEach((a) => {
+    const end = dayjs(a.endTime);
+    if (end.isBefore(requestedDateTime)) {
+      if (!previous || end.isAfter(dayjs(previous.endTime))) {
+        previous = a;
+      }
+    }
+  });
+  return previous;
+}
+
+// ---- MAIN WEBHOOK ----
+app.post("/check-available-slots", async (req, res) => {
+  try {
+    console.log("Incoming GHL Webhook:", req.body);
+
+    const { customData, calendar } = req.body;
+    const customerAddress = customData?.customerAddress;
+    const staffAddress = customData?.staffAddress;
+    const requestedDate = customData?.requestedDate;
+    const requestedTime = customData?.requestedTime;
+    const calendarId = calendar?.id;
+
+    if (!customerAddress || !staffAddress || !requestedDate || !requestedTime) {
+      return res
+        .status(400)
+        .json({ error: "Missing required fields in webhook payload" });
+    }
+
+    const requestedDateTime = dayjs(`${requestedDate} ${requestedTime}`);
+
+    // 1️⃣ Get all appointments for that day from GHL
+    const appointments = await getAppointmentsFromGHL(calendarId, requestedDate);
+
+    // 2️⃣ Find previous appointment (before requested time)
+    const previous = findPreviousAppointment(appointments, requestedDateTime);
+
+    // 3️⃣ If none → this is first appointment of the day
+    if (!previous) {
+      return res.json({
+        message: "✅ First appointment of the day (no previous appointment).",
+        suggestedSlot: `${requestedTime} (start of day)`,
+      });
+    }
+
+    // 4️⃣ Calculate travel time between previous and new appointment
+    const travel = await getTravelTime(previous.address, customerAddress);
+    if (!travel) {
+      return res.status(400).json({
+        error: "Failed to calculate distance between addresses.",
+      });
+    }
+
+    // 5️⃣ Suggest slot based on travel buffer
+    const prevEnd = dayjs(previous.endTime);
+    const suggestedStart = prevEnd.add(travel.durationMinutes, "minute");
+    const suggestedEnd = suggestedStart.add(30, "minute"); // default 30min slot
+
+    const businessClose = dayjs(`${requestedDate} ${BUSINESS_END}`);
+    if (suggestedStart.isAfter(businessClose)) {
+      return res.json({
+        message: "⏰ Office closed. Suggesting next day 9:00 AM slot.",
+        suggestedSlot: "Next business day 9:00 AM",
+      });
+    }
+
+    // 6️⃣ Return final response
     return res.json({
       message: "✅ Available slot calculated successfully",
-      distance,
-      travelDuration: duration,
-      totalTravelTime: `${Math.round(totalTravelTime)} minutes`,
-      suggestedSlot: availableSlot,
+      distance: travel.distanceText,
+      travelDuration: travel.durationText,
+      totalTravelTime: `${travel.durationMinutes} minutes`,
+      suggestedSlot: `${suggestedStart.format("hh:mm A")} - ${suggestedEnd.format(
+        "hh:mm A"
+      )}`,
+      previousAppointment: {
+        address: previous.address,
+        endTime: previous.endTime,
+      },
     });
-  } catch (error) {
-    console.error("❌ Error:", error.message);
-    return res.status(500).json({ error: error.message });
+  } catch (err) {
+    console.error("Webhook Error:", err.message);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
-// ✅ Use Render’s dynamic port
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running successfully on port ${PORT}`));
-
-
+app.listen(PORT, () =>
+  console.log(`✅ GHL Webhook live at http://localhost:${PORT}`)
+);
