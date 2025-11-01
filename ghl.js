@@ -85,17 +85,44 @@ function findPreviousAppointment(appointments, requestedDateTime) {
   return previous;
 }
 
+async function sendMessageToGHL(contactId, slotInfo) {
+  try {
+    await axios.post(
+      `https://services.leadconnectorhq.com//conversations/messages`,
+      {
+        contactId,
+        message: `${slotInfo.message}\nDistance: ${slotInfo.distance}\nTravel Time: ${slotInfo.travelDuration}`,
+        type: "Inbound", // Inbound = from bot to customer
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${GHL_API_KEY}`,
+          Version: "2021-07-28",
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    console.log("Message sent successfully to GHL contact");
+  } catch (error) {
+    console.error("Failed to send GHL message:", error.response?.data || error);
+  }
+}
+
+
 // ---- MAIN WEBHOOK ----
 app.post("/check-available-slots", async (req, res) => {
   try {
     console.log("Incoming GHL Webhook:", req.body);
 
-    const { customData, calendar } = req.body;
+    const { contact, customData, calendar } = req.body;
     const customerAddress = customData?.customerAddress;
     const staffAddress = customData?.staffAddress;
     const requestedDate = customData?.requestedDate;
     const requestedTime = customData?.requestedTime;
     const calendarId = calendar?.id;
+
+    const contactId = contact?.id;
+    let slotInfo;
 
     if (!customerAddress || !staffAddress || !requestedDate || !requestedTime) {
       return res
@@ -105,21 +132,24 @@ app.post("/check-available-slots", async (req, res) => {
 
     const requestedDateTime = dayjs(`${requestedDate} ${requestedTime}`);
 
-    // 1️⃣ Get all appointments for that day from GHL
+    // 1️ Get all appointments for that day from GHL
     const appointments = await getAppointmentsFromGHL(calendarId, requestedDate);
 
-    // 2️⃣ Find previous appointment (before requested time)
+    // 2️ Find previous appointment (before requested time)
     const previous = findPreviousAppointment(appointments, requestedDateTime);
 
-    // 3️⃣ If none → this is first appointment of the day
+    // 3️ If none → this is first appointment of the day
     if (!previous) {
-      return res.json({
-        message: "✅ First appointment of the day (no previous appointment).",
+      const slotInfo = {
+        message: "First appointment of the day (no previous appointment).",
         suggestedSlot: `${requestedTime} (start of day)`,
-      });
+      };
+
+      await sendMessageToGHL(contactId, slotInfo);
+      return res.json({ status: "success", ...slotInfo });
     }
 
-    // 4️⃣ Calculate travel time between previous and new appointment
+    // 4️ Calculate travel time between previous and new appointment
     const travel = await getTravelTime(previous.address, customerAddress);
     if (!travel) {
       return res.status(400).json({
@@ -127,33 +157,36 @@ app.post("/check-available-slots", async (req, res) => {
       });
     }
 
-    // 5️⃣ Suggest slot based on travel buffer
+    // 5️ Suggest slot based on travel buffer
     const prevEnd = dayjs(previous.endTime);
     const suggestedStart = prevEnd.add(travel.durationMinutes, "minute");
     const suggestedEnd = suggestedStart.add(30, "minute"); // default 30min slot
 
     const businessClose = dayjs(`${requestedDate} ${BUSINESS_END}`);
+  
     if (suggestedStart.isAfter(businessClose)) {
-      return res.json({
-        message: "⏰ Office closed. Suggesting next day 9:00 AM slot.",
+      slotInfo = {
+        message: "Office closed. Suggesting next day 9:00 AM slot.",
         suggestedSlot: "Next business day 9:00 AM",
-      });
+        distance: travel.distanceText,
+        travelDuration: travel.durationText,
+      };
+    } else {
+      slotInfo = {
+        message: "Available slot calculated successfully",
+        distance: travel.distanceText,
+        travelDuration: travel.durationText,
+        totalTravelTime: `${travel.durationMinutes} minutes`,
+        suggestedSlot: `${suggestedStart.format("hh:mm A")} - ${suggestedEnd.format("hh:mm A")}`,
+        previousAppointment: {
+          address: previous.address,
+          endTime: previous.endTime,
+        },
+      }; 
     }
 
-    // 6️⃣ Return final response
-    return res.json({
-      message: "✅ Available slot calculated successfully",
-      distance: travel.distanceText,
-      travelDuration: travel.durationText,
-      totalTravelTime: `${travel.durationMinutes} minutes`,
-      suggestedSlot: `${suggestedStart.format("hh:mm A")} - ${suggestedEnd.format(
-        "hh:mm A"
-      )}`,
-      previousAppointment: {
-        address: previous.address,
-        endTime: previous.endTime,
-      },
-    });
+    if (contactId) await sendMessageToGHL(contactId, slotInfo);
+    res.json({ status: "success", ...slotInfo });
   } catch (err) {
     console.error("Webhook Error:", err.message);
     res.status(500).json({ error: "Internal Server Error" });
